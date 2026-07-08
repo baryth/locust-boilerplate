@@ -1,0 +1,22 @@
+# Baseline expectations per endpoint.
+#
+# Keys must match the `name=` used in the corresponding self.get(...) /
+# self.post(...) call in src/tasks/.
+#
+#   p50_ms   - median response time we consider "normal"
+#   p95_ms   - tail response time we consider "normal"
+#   max_cv   - max acceptable coefficient of variation (stdev / mean),
+#              i.e. how "jittery" responses are allowed to be
+#
+# An endpoint with no entry here is still measured and reported, it's
+# just never flagged against a threshold.
+
+"GET /api/v1/topics":
+  p50_ms: 150
+  p95_ms: 400
+  max_cv: 0.5
+
+"POST /api/v1/subscriptions/subscribe":
+  p50_ms: 250
+  p95_ms: 600
+  max_cv: 0.6
