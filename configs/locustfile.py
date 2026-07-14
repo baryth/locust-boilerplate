@@ -239,15 +239,58 @@ class SubscriptionUser(HttpUser):
             if resp.status_code in (200, 201):
                 try:
                     data = resp.json()
-                    sub_id = data.get("id") or data.get("subscription_id")
-                    if sub_id is not None:
-                        # newly created subscriptions start out "paused"
-                        self.subscriptions[sub_id] = STATUS_PAUSED
-                    resp.success()
                 except ValueError:
                     resp.failure("Invalid JSON response")
+                    return
+
+                sub_id = self._extract_subscription_id(data)
+                if sub_id is not None:
+                    # newly created subscriptions start out "paused"
+                    self.subscriptions[sub_id] = STATUS_PAUSED
+                    resp.success()
+                else:
+                    # The subscription may well exist server-side at this
+                    # point -- we just couldn't find its id in the response
+                    # to track it locally. That's a real correctness bug
+                    # (this VU can now never activate/pause/delete it), so
+                    # surface it as a failure instead of silently passing.
+                    logger.warning(
+                        "[%s] create_subscription: couldn't find an id in response: %s",
+                        self.client_id, data,
+                    )
+                    resp.failure("Response body had no recognizable subscription id")
             else:
                 resp.failure(f"Unexpected status {resp.status_code}")
+
+    @staticmethod
+    def _extract_subscription_id(data):
+        """Try the response shapes we know about. GET /subscriptions returns
+        flat items shaped {"id": ..., "queue": ..., "state": ..., ...} --
+        POST /subscriptions/subscribe is assumed to return one such item
+        directly, but may nest it or use a different key. Extend this list
+        if a real response body doesn't match any of these."""
+        if not isinstance(data, dict):
+            return None
+
+        for key in ("id", "subscription_id", "queue"):
+            value = data.get(key)
+            if value is not None:
+                return value
+
+        # Maybe it's nested, e.g. {"subcription": {"id": ...}}
+        # Note: the real API wraps single items under "subcription" (missing
+        # the second "s") -- confirmed from a real GET /subscriptions/:id
+        # response. Kept "subscription" too as a defensive fallback in case
+        # that typo ever gets fixed API-side.
+        for wrapper_key in ("subcription", "subscription", "data", "result"):
+            nested = data.get(wrapper_key)
+            if isinstance(nested, dict):
+                for key in ("id", "subscription_id", "queue"):
+                    value = nested.get(key)
+                    if value is not None:
+                        return value
+
+        return None
 
     @task(2)
     def activate_subscription(self):
