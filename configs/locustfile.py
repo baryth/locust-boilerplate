@@ -279,33 +279,18 @@ class SubscriptionUser(HttpUser):
 
     @staticmethod
     def _extract_subscription_id(data):
-        """Try the response shapes we know about. GET /subscriptions returns
-        flat items shaped {"id": ..., "queue": ..., "state": ..., ...} --
-        POST /subscriptions/subscribe is assumed to return one such item
-        directly, but may nest it or use a different key. Extend this list
-        if a real response body doesn't match any of these."""
+        """Extract the id from a POST /subscriptions/subscribe response.
+
+        Confirmed real shape (flat body):
+            {"subscriptionId": "...", "queue": "..."}
+
+        "subscriptionId" is the only source of truth here -- "queue" is a
+        separate, distinct value on the real API (not a reliable stand-in
+        for the id) and is intentionally not used as a fallback.
+        """
         if not isinstance(data, dict):
             return None
-
-        for key in ("id", "subscription_id", "queue"):
-            value = data.get(key)
-            if value is not None:
-                return value
-
-        # Maybe it's nested, e.g. {"subcription": {"id": ...}}
-        # Note: the real API wraps single items under "subcription" (missing
-        # the second "s") -- confirmed from a real GET /subscriptions/:id
-        # response. Kept "subscription" too as a defensive fallback in case
-        # that typo ever gets fixed API-side.
-        for wrapper_key in ("subcription", "subscription", "data", "result"):
-            nested = data.get(wrapper_key)
-            if isinstance(nested, dict):
-                for key in ("id", "subscription_id", "queue"):
-                    value = nested.get(key)
-                    if value is not None:
-                        return value
-
-        return None
+        return data.get("subscriptionId")
 
     @task(2)
     def activate_subscription(self):
