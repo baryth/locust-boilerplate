@@ -29,6 +29,7 @@ import logging
 import random
 from threading import Lock
 
+import gevent
 from locust import HttpUser, task, between, events
 
 # ---- CONFIG: edit to match your real API ----
@@ -124,7 +125,14 @@ def setup_smoke_stop_condition(environment, **kwargs):
             count = _smoke_counter["count"]
         if count == target:
             logger.info("Smoke target of %d scenario request(s) reached -- stopping", target)
-            environment.runner.quit()
+            # Spawn this in its own greenlet rather than calling it inline.
+            # environment.runner.quit() calls self.greenlet.kill(block=True),
+            # and this callback is itself running on one of the runner's own
+            # greenlets (triggered synchronously from the request event) --
+            # calling quit() directly from there can hang shutdown instead
+            # of completing it, which also means the --html report never
+            # gets written. Decoupling it into a fresh greenlet avoids that.
+            gevent.spawn(environment.runner.quit)
         elif count > target:
             # A few in-flight requests can land after the quit signal is
             # sent; that's expected and harmless, just noise to be aware of.
@@ -244,21 +252,28 @@ class SubscriptionUser(HttpUser):
                     return
 
                 sub_id = self._extract_subscription_id(data)
-                if sub_id is not None:
-                    # newly created subscriptions start out "paused"
-                    self.subscriptions[sub_id] = STATUS_PAUSED
-                    resp.success()
-                else:
-                    # The subscription may well exist server-side at this
-                    # point -- we just couldn't find its id in the response
-                    # to track it locally. That's a real correctness bug
-                    # (this VU can now never activate/pause/delete it), so
-                    # surface it as a failure instead of silently passing.
+                logger.debug(
+                    "[%s] create_subscription: extracted sub_id=%r from response: %s",
+                    self.client_id, sub_id, data,
+                )
+                # Guard against anything that isn't a real, non-empty string
+                # id -- e.g. an accidental bare `id` (the Python builtin,
+                # not a string) leaking in from a bad .get(key, id) default
+                # somewhere. Storing that would silently produce broken
+                # URLs like /subscriptions/<built-in function id>/resume
+                # later. Treat it the same as "couldn't find an id."
+                if not isinstance(sub_id, str) or not sub_id:
                     logger.warning(
-                        "[%s] create_subscription: couldn't find an id in response: %s",
-                        self.client_id, data,
+                        "[%s] create_subscription: extracted sub_id is not a "
+                        "valid string (got %r, type=%s) -- response was: %s",
+                        self.client_id, sub_id, type(sub_id).__name__, data,
                     )
-                    resp.failure("Response body had no recognizable subscription id")
+                    resp.failure(f"Extracted id is not a valid string: {sub_id!r}")
+                    return
+
+                # newly created subscriptions start out "paused"
+                self.subscriptions[sub_id] = STATUS_PAUSED
+                resp.success()
             else:
                 resp.failure(f"Unexpected status {resp.status_code}")
 
@@ -311,6 +326,10 @@ class SubscriptionUser(HttpUser):
                 self.subscriptions[sub_id] = STATUS_ACTIVE
                 resp.success()
             else:
+                logger.warning(
+                    "[%s] activate_subscription: id=%s status=%d body=%s",
+                    self.client_id, sub_id, resp.status_code, resp.text,
+                )
                 resp.failure(f"Unexpected status {resp.status_code}")
 
     @task(2)
@@ -332,6 +351,10 @@ class SubscriptionUser(HttpUser):
                 self.subscriptions[sub_id] = STATUS_PAUSED
                 resp.success()
             else:
+                logger.warning(
+                    "[%s] pause_subscription: id=%s status=%d body=%s",
+                    self.client_id, sub_id, resp.status_code, resp.text,
+                )
                 resp.failure(f"Unexpected status {resp.status_code}")
 
     @task(2)
@@ -384,4 +407,8 @@ class SubscriptionUser(HttpUser):
                 del self.subscriptions[sub_id]
                 resp.success()
             else:
+                logger.warning(
+                    "[%s] delete_subscription: id=%s status=%d body=%s",
+                    self.client_id, sub_id, resp.status_code, resp.text,
+                )
                 resp.failure(f"Unexpected status {resp.status_code}")
