@@ -57,7 +57,7 @@ from locust import LoadTestShape, events
 
 # ---- CONFIG ----
 RAMP_START_USERS = 1
-PEAK_USERS = 100
+PEAK_USERS = 150
 RAMP_DURATION_SECONDS = 10 * 60   # time to climb from START to PEAK, continuous (no holds)
 SPAWN_RATE = 1                    # users/sec -- keeps the climb smooth, not step-y
 MAX_DURATION_SECONDS = 20 * 60    # safety net if the threshold is never crossed
@@ -128,8 +128,22 @@ def _start_breakage_monitor(environment, **kwargs):
             if len(response_time_snapshot) < MIN_REQUESTS_BEFORE_CHECK:
                 continue
 
-            # Trigger 1: response-time degradation
+            # Trajectory logging -- prints every cycle (not just at the
+            # trigger) so you can see the climb toward a break, not just
+            # the single snapshot where it happened to cross. Useful for
+            # telling "cruising well under threshold" apart from
+            # "climbing steadily and about to cross" in a run that never
+            # actually triggers.
             current_pct = _percentile(response_time_snapshot, MONITOR_PERCENTILE)
+            failure_rate = sum(failure_snapshot) / len(failure_snapshot)
+            print(
+                f"[stress] trajectory: rolling p{int(MONITOR_PERCENTILE * 100)}="
+                f"{current_pct:.0f}ms (threshold {RESPONSE_TIME_THRESHOLD_MS}ms), "
+                f"failure_rate={failure_rate:.1%} (threshold {FAILURE_RATE_THRESHOLD:.1%}), "
+                f"window={len(failure_snapshot)}"
+            )
+
+            # Trigger 1: response-time degradation
             if current_pct is not None and current_pct > RESPONSE_TIME_THRESHOLD_MS:
                 stop_run(
                     f"rolling p{int(MONITOR_PERCENTILE * 100)} response time "
@@ -140,7 +154,6 @@ def _start_breakage_monitor(environment, **kwargs):
 
             # Trigger 2: failure rate -- catches fast-failing errors (like
             # a 500 returned quickly) that a latency-only monitor can't see.
-            failure_rate = sum(failure_snapshot) / len(failure_snapshot)
             if failure_rate > FAILURE_RATE_THRESHOLD:
                 stop_run(
                     f"rolling failure rate {failure_rate:.1%} exceeded threshold "
