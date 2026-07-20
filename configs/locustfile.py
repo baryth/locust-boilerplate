@@ -25,12 +25,10 @@ Each VU keeps its own local pool of subscription IDs + expected state, so:
 
 import csv
 import itertools
-import logging
 import random
 from threading import Lock
 
-import gevent
-from locust import HttpUser, task, between, events
+from locust import HttpUser, task, constant
 
 # ---- CONFIG: edit to match your real API ----
 AUTH_URL = "REPLACE_WITH_AUTH_URI"  # paste the token endpoint URI here
@@ -40,28 +38,6 @@ AUTH_SCOPE = "123"                    # scope is shared across all credential pa
 
 # Client credentials grant -- sent as form-data (not JSON)
 AUTH_GRANT_TYPE = "client_credentials"
-
-# Names of the one-time-per-VU startup requests, excluded from the
-# --smoke-iterations count below since they aren't part of the repeated
-# scenario mix (create/activate/pause/get/delete).
-STARTUP_REQUEST_NAMES = {"/auth [GET] (startup)", "/topics [GET] (startup)"}
-
-
-@events.init_command_line_parser.add_listener
-def add_smoke_test_args(parser):
-    parser.add_argument(
-        "--smoke-iterations",
-        type=int,
-        default=None,
-        env_var="LOCUST_SMOKE_ITERATIONS",
-        help=(
-            "Stop the whole swarm once this many scenario requests "
-            "(create/activate/pause/get/delete -- startup auth/topics calls "
-            "don't count) have completed. Intended for Phase 1 smoke runs. "
-            "Leave unset for load/stress phases, where --run-time controls "
-            "duration instead."
-        ),
-    )
 
 
 def load_credentials(path):
@@ -88,7 +64,9 @@ _credential_lock = Lock()
 def get_next_credentials():
     with _credential_lock:
         return next(_credential_cycle)
+    
 
+HEALTH_ENDPOINT = "/healthCheck"
 TOPICS_ENDPOINT = "/topics"
 SUBSCRIPTIONS_ENDPOINT = "/subscriptions"
 CREATE_PATH = "/subscriptions/subscribe"           # POST
@@ -102,45 +80,9 @@ STATUS_ACTIVE = "Active"
 
 CONTENT_TYPE_HEADER = {"Content-Type": "application/json"}
 
-logger = logging.getLogger(__name__)
-
-_smoke_counter = {"count": 0}
-_smoke_lock = Lock()
-
-
-@events.init.add_listener
-def setup_smoke_stop_condition(environment, **kwargs):
-    target = environment.parsed_options.smoke_iterations
-    if not target:
-        return  # not a smoke run -- normal load/stress phases ignore this entirely
-
-    logger.info("Smoke mode: will stop after %d scenario request(s)", target)
-
-    @events.request.add_listener
-    def on_request(name, **kwargs):
-        if name in STARTUP_REQUEST_NAMES:
-            return
-        with _smoke_lock:
-            _smoke_counter["count"] += 1
-            count = _smoke_counter["count"]
-        if count == target:
-            logger.info("Smoke target of %d scenario request(s) reached -- stopping", target)
-            # Spawn this in its own greenlet rather than calling it inline.
-            # environment.runner.quit() calls self.greenlet.kill(block=True),
-            # and this callback is itself running on one of the runner's own
-            # greenlets (triggered synchronously from the request event) --
-            # calling quit() directly from there can hang shutdown instead
-            # of completing it, which also means the --html report never
-            # gets written. Decoupling it into a fresh greenlet avoids that.
-            gevent.spawn(environment.runner.quit)
-        elif count > target:
-            # A few in-flight requests can land after the quit signal is
-            # sent; that's expected and harmless, just noise to be aware of.
-            pass
-
 
 class SubscriptionUser(HttpUser):
-    wait_time = between(1, 3)  # think-time between tasks, per VU
+    wait_time = constant(11)  # fixed think-time between tasks, per VU
 
     # Shared across every VU in this worker process. Topics are static
     # reference data -- fetched once by whichever VU gets there first,
@@ -151,12 +93,25 @@ class SubscriptionUser(HttpUser):
     _topics_cache = None
     _topics_lock = Lock()
 
+    def is_healtly(self):
+        with self.client.get(
+            HEALTH_ENDPOINT,
+            name="Sprawdzam czy serwerek stoi i jest gotowy tak jak twój VPN ^^", catch_response=True
+            ) as resp:
+                if resp.status_code == 200:
+                    resp.success()
+                    return True
+                else:
+                    resp.failure("Czy aby napewno jesteś zapięty przez VPN?")
+                    return False
+
     def on_start(self):
         self.headers = {}
         self.subscriptions = {}     # {subscription_id: expected_status}, owned by THIS VU only
         self.client_id, self.client_secret = get_next_credentials()
-        self.authenticate()
-        self.topics = self._get_shared_topics()
+        if self.is_healtly(self):
+            self.authenticate()
+            self.topics = self._get_shared_topics()
 
     def authenticate(self):
         """Get a bearer token via the client-credentials grant, once per VU
@@ -230,10 +185,9 @@ class SubscriptionUser(HttpUser):
                 resp.failure(f"Unexpected status {resp.status_code}")
                 return []
 
-    @task(2)
+    @task(4)
     def create_subscription(self):
         if not self.topics:
-            logger.debug("[%s] skip create_subscription: no topics loaded", self.client_id)
             return  # need topics first
 
         sample_size = random.randint(1, min(3, len(self.topics)))
@@ -252,23 +206,8 @@ class SubscriptionUser(HttpUser):
                     return
 
                 sub_id = self._extract_subscription_id(data)
-                logger.debug(
-                    "[%s] create_subscription: extracted sub_id=%r from response: %s",
-                    self.client_id, sub_id, data,
-                )
-                # Guard against anything that isn't a real, non-empty string
-                # id -- e.g. an accidental bare `id` (the Python builtin,
-                # not a string) leaking in from a bad .get(key, id) default
-                # somewhere. Storing that would silently produce broken
-                # URLs like /subscriptions/<built-in function id>/resume
-                # later. Treat it the same as "couldn't find an id."
-                if not isinstance(sub_id, str) or not sub_id:
-                    logger.warning(
-                        "[%s] create_subscription: extracted sub_id is not a "
-                        "valid string (got %r, type=%s) -- response was: %s",
-                        self.client_id, sub_id, type(sub_id).__name__, data,
-                    )
-                    resp.failure(f"Extracted id is not a valid string: {sub_id!r}")
+                if sub_id is None:
+                    resp.failure("Response body had no subscriptionId")
                     return
 
                 # newly created subscriptions start out "paused"
@@ -292,14 +231,10 @@ class SubscriptionUser(HttpUser):
             return None
         return data.get("subscriptionId")
 
-    @task(2)
+    @task(3)
     def activate_subscription(self):
         candidates = self._ids_with_status(STATUS_PAUSED)
         if not candidates:
-            logger.debug(
-                "[%s] skip activate_subscription: no paused subscriptions (owns %d total)",
-                self.client_id, len(self.subscriptions),
-            )
             return  # nothing eligible to activate right now
         sub_id = random.choice(candidates)
         url = ACTIVATE_PATH.format(id=sub_id)
@@ -311,20 +246,12 @@ class SubscriptionUser(HttpUser):
                 self.subscriptions[sub_id] = STATUS_ACTIVE
                 resp.success()
             else:
-                logger.warning(
-                    "[%s] activate_subscription: id=%s status=%d body=%s",
-                    self.client_id, sub_id, resp.status_code, resp.text,
-                )
                 resp.failure(f"Unexpected status {resp.status_code}")
 
-    @task(2)
+    @task(3)
     def pause_subscription(self):
         candidates = self._ids_with_status(STATUS_ACTIVE)
         if not candidates:
-            logger.debug(
-                "[%s] skip pause_subscription: no active subscriptions (owns %d total)",
-                self.client_id, len(self.subscriptions),
-            )
             return  # nothing eligible to pause right now
         sub_id = random.choice(candidates)
         url = PAUSE_PATH.format(id=sub_id)
@@ -336,13 +263,9 @@ class SubscriptionUser(HttpUser):
                 self.subscriptions[sub_id] = STATUS_PAUSED
                 resp.success()
             else:
-                logger.warning(
-                    "[%s] pause_subscription: id=%s status=%d body=%s",
-                    self.client_id, sub_id, resp.status_code, resp.text,
-                )
                 resp.failure(f"Unexpected status {resp.status_code}")
 
-    @task(2)
+    @task(1)
     def get_subscriptions(self):
         with self.client.get(
             SUBSCRIPTIONS_ENDPOINT, headers=self.headers,
@@ -372,7 +295,6 @@ class SubscriptionUser(HttpUser):
                     mismatches.append(f"{sid}: expected={expected} got={api_state}")
 
             if mismatches:
-                logger.warning("[%s] state mismatch detected: %s", self.client_id, "; ".join(mismatches))
                 resp.failure(f"Status mismatch: {'; '.join(mismatches)}")
             else:
                 resp.success()
@@ -380,7 +302,6 @@ class SubscriptionUser(HttpUser):
     @task(1)
     def delete_subscription(self):
         if not self.subscriptions:
-            logger.debug("[%s] skip delete_subscription: owns no subscriptions", self.client_id)
             return
         sub_id = random.choice(list(self.subscriptions.keys()))
         url = DELETE_PATH.format(id=sub_id)
@@ -392,8 +313,4 @@ class SubscriptionUser(HttpUser):
                 del self.subscriptions[sub_id]
                 resp.success()
             else:
-                logger.warning(
-                    "[%s] delete_subscription: id=%s status=%d body=%s",
-                    self.client_id, sub_id, resp.status_code, resp.text,
-                )
                 resp.failure(f"Unexpected status {resp.status_code}")
