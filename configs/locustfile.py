@@ -64,9 +64,8 @@ _credential_lock = Lock()
 def get_next_credentials():
     with _credential_lock:
         return next(_credential_cycle)
-    
 
-HEALTH_ENDPOINT = "/healthCheck"
+
 TOPICS_ENDPOINT = "/topics"
 SUBSCRIPTIONS_ENDPOINT = "/subscriptions"
 CREATE_PATH = "/subscriptions/subscribe"           # POST
@@ -77,8 +76,6 @@ DELETE_PATH = "/subscriptions/{id}/unsubscribe"    # DELETE
 # Status string values as returned by the API -- edit if yours differ
 STATUS_PAUSED = "Paused"
 STATUS_ACTIVE = "Active"
-
-CONTENT_TYPE_HEADER = {"Content-Type": "application/json"}
 
 
 class SubscriptionUser(HttpUser):
@@ -93,25 +90,12 @@ class SubscriptionUser(HttpUser):
     _topics_cache = None
     _topics_lock = Lock()
 
-    def is_healtly(self):
-        with self.client.get(
-            HEALTH_ENDPOINT,
-            name="Sprawdzam czy serwerek stoi i jest gotowy tak jak twój VPN ^^", catch_response=True
-            ) as resp:
-                if resp.status_code == 200:
-                    resp.success()
-                    return True
-                else:
-                    resp.failure("Czy aby napewno jesteś zapięty przez VPN?")
-                    return False
-
     def on_start(self):
         self.headers = {}
         self.subscriptions = {}     # {subscription_id: expected_status}, owned by THIS VU only
         self.client_id, self.client_secret = get_next_credentials()
-        if self.is_healtly(self):
-            self.authenticate()
-            self.topics = self._get_shared_topics()
+        self.authenticate()
+        self.topics = self._get_shared_topics()
 
     def authenticate(self):
         """Get a bearer token via the client-credentials grant, once per VU
@@ -128,22 +112,23 @@ class SubscriptionUser(HttpUser):
             AUTH_URL, data=payload,
             name="/auth [GET] (startup)", catch_response=True
         ) as resp:
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    token = data.get("access_token")
-                    if token:
-                        self.headers = {
-                            "Authorization": f"Bearer {token}",
-                            "Content-Type": "application/json",
-                        }
-                        resp.success()
-                    else:
-                        resp.failure("No access_token in auth response")
-                except ValueError:
-                    resp.failure("Invalid JSON response")
-            else:
+            if resp.status_code != 200:
                 resp.failure(f"Unexpected status {resp.status_code}")
+                return
+            try:
+                data = resp.json()
+            except ValueError:
+                resp.failure("Invalid JSON response")
+                return
+            token = data.get("access_token")
+            if not token:
+                resp.failure("No access_token in auth response")
+                return
+            self.headers = {
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+            }
+            resp.success()
 
     def _ids_with_status(self, status):
         return [sid for sid, st in self.subscriptions.items() if st == status]
@@ -154,36 +139,42 @@ class SubscriptionUser(HttpUser):
         @task -- topics are static reference data and re-fetching them
         during the steady-state load adds no useful signal, just noise."""
         cls = type(self)
-        if cls._topics_cache is not None:
+        if cls._topics_cache:
             return cls._topics_cache
 
         with cls._topics_lock:
             # Re-check after acquiring the lock -- another VU may have
             # finished the fetch while we were waiting on it.
-            if cls._topics_cache is None:
-                cls._topics_cache = self._fetch_topics_from_api()
-        return cls._topics_cache
+            if cls._topics_cache:
+                return cls._topics_cache
+            # Only a non-empty result gets cached. A failed/empty fetch
+            # returns [] so this VU sits out this round, and the next VU
+            # retries instead of the whole worker being poisoned by one
+            # bad first fetch.
+            fetched = self._fetch_topics_from_api()
+            if fetched:
+                cls._topics_cache = fetched
+            return fetched
 
     def _fetch_topics_from_api(self):
         with self.client.get(
             TOPICS_ENDPOINT, headers=self.headers,
             name="/topics [GET] (startup)", catch_response=True
         ) as resp:
-            if resp.status_code == 200:
-                try:
-                    data = resp.json()
-                    topics = data.get("topics", []) if isinstance(data, dict) else data
-                    # topics come back as {"name": ..., "description": ...} -- no id field,
-                    # "name" is the identifier used to create a subscription
-                    fetched = [t["name"] for t in topics if "name" in t]
-                    resp.success()
-                    return fetched
-                except ValueError:
-                    resp.failure("Invalid JSON response")
-                    return []
-            else:
+            if resp.status_code != 200:
                 resp.failure(f"Unexpected status {resp.status_code}")
                 return []
+            try:
+                data = resp.json()
+            except ValueError:
+                resp.failure("Invalid JSON response")
+                return []
+            topics = data.get("topics", []) if isinstance(data, dict) else data
+            # topics come back as {"name": ..., "description": ...} -- no id field,
+            # "name" is the identifier used to create a subscription
+            fetched = [t["name"] for t in topics if "name" in t]
+            resp.success()
+            return fetched
 
     @task(4)
     def create_subscription(self):
@@ -231,39 +222,37 @@ class SubscriptionUser(HttpUser):
             return None
         return data.get("subscriptionId")
 
+    def _change_state(self, sub_id, path, new_status, name):
+        """PUT to `path` for one subscription; on success record `new_status`
+        as this VU's new local expectation for it. Shared by the resume and
+        pause tasks, which differ only in path/status/report name."""
+        with self.client.put(
+            path.format(id=sub_id), headers=self.headers,
+            name=name, catch_response=True
+        ) as resp:
+            if resp.status_code in (200, 204):
+                self.subscriptions[sub_id] = new_status
+                resp.success()
+            else:
+                resp.failure(f"Unexpected status {resp.status_code}")
+
     @task(3)
     def activate_subscription(self):
         candidates = self._ids_with_status(STATUS_PAUSED)
         if not candidates:
             return  # nothing eligible to activate right now
-        sub_id = random.choice(candidates)
-        url = ACTIVATE_PATH.format(id=sub_id)
-        with self.client.put(
-            url, headers=self.headers,
-            name="/subscriptions/:id/resume [PUT]", catch_response=True
-        ) as resp:
-            if resp.status_code in (200, 204):
-                self.subscriptions[sub_id] = STATUS_ACTIVE
-                resp.success()
-            else:
-                resp.failure(f"Unexpected status {resp.status_code}")
+        self._change_state(
+            random.choice(candidates), ACTIVATE_PATH,
+            STATUS_ACTIVE, "/subscriptions/:id/resume [PUT]")
 
     @task(3)
     def pause_subscription(self):
         candidates = self._ids_with_status(STATUS_ACTIVE)
         if not candidates:
             return  # nothing eligible to pause right now
-        sub_id = random.choice(candidates)
-        url = PAUSE_PATH.format(id=sub_id)
-        with self.client.put(
-            url, headers=self.headers,
-            name="/subscriptions/:id/pause [PUT]", catch_response=True
-        ) as resp:
-            if resp.status_code in (200, 204):
-                self.subscriptions[sub_id] = STATUS_PAUSED
-                resp.success()
-            else:
-                resp.failure(f"Unexpected status {resp.status_code}")
+        self._change_state(
+            random.choice(candidates), PAUSE_PATH,
+            STATUS_PAUSED, "/subscriptions/:id/pause [PUT]")
 
     @task(1)
     def get_subscriptions(self):
