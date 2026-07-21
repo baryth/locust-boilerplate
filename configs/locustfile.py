@@ -1,26 +1,24 @@
 """
 Locust load test for the Topics/Subscriptions API.
 
-On VU startup (once, not part of the load loop):
-  GET /topics -> fetch topic list (static reference data, no need to re-poll)
+At startup, each simulated user (VU) grabs the topic list once -- topics
+don't change, so there's no reason to keep asking for them.
 
-Repeated load tasks per virtual user (VU), weighted/randomized by Locust:
-  - POST   /subscriptions/subscribe        -> create subscription from random topics (starts "Paused")
-  - PUT    /subscriptions/{id}/resume      -> resume/activate a random PAUSED subscription owned by this VU
-  - PUT    /subscriptions/{id}/pause       -> pause a random ACTIVE subscription owned by this VU
-  - GET    /subscriptions                  -> fetch current subscriptions and verify each one's
-                                               state matches what this VU expects locally
-  - DELETE /subscriptions/{id}/unsubscribe -> unsubscribe a random subscription owned by this VU
+Then each VU loops over these tasks at random (numbers are the weights):
+  - POST   /subscriptions/subscribe        -> create a subscription (starts "Paused")
+  - PUT    /subscriptions/{id}/resume      -> resume one of its own Paused subs
+  - PUT    /subscriptions/{id}/pause       -> pause one of its own Active subs
+  - GET    /subscriptions                  -> list its subs and check the states match
+  - DELETE /subscriptions/{id}/unsubscribe -> unsubscribe one of its own subs
 
-Each VU keeps its own local pool of subscription IDs + expected state, so:
-  - VUs never touch each other's data (no cross-VU write contention on one account)
-  - resume is only ever called on subscriptions this VU believes are "Paused"
-  - pause is only ever called on subscriptions this VU believes are "Active"
-  - the GET /subscriptions step cross-checks the API's reported state against
-    what this VU expects, and fails the request if they disagree (catches
-    stale/incorrect state -- a real correctness signal, not just latency)
+Every VU only ever touches subscriptions it created, and remembers what
+state each one should be in. Two things fall out of that:
+  - VUs never step on each other's data, so no false failures from sharing.
+  - The GET task compares what the API says against what the VU expects and
+    fails the request if they disagree -- so this test catches wrong state,
+    not just slow responses.
 
---- EDIT THESE BEFORE RUNNING ---
+--- Fill in the CONFIG values below before running ---
 """
 
 import csv
@@ -30,14 +28,12 @@ from threading import Lock
 
 from locust import HttpUser, task, constant
 
-# ---- CONFIG: edit to match your real API ----
-AUTH_URL = "REPLACE_WITH_AUTH_URI"  # paste the token endpoint URI here
+# ---- CONFIG: fill these in to match your real API ----
+AUTH_URL = "REPLACE_WITH_AUTH_URI"  # the login / token endpoint
 
-CREDENTIALS_FILE = "credentials.csv"  # CSV with header: client_id,client_secret
-AUTH_SCOPE = "123"                    # scope is shared across all credential pairs
-
-# Client credentials grant -- sent as form-data (not JSON)
-AUTH_GRANT_TYPE = "client_credentials"
+CREDENTIALS_FILE = "credentials.csv"  # CSV with a header row: client_id,client_secret
+AUTH_SCOPE = "123"                    # same scope for every account
+AUTH_GRANT_TYPE = "client_credentials"  # login type, sent as form data (not JSON)
 
 
 def load_credentials(path):
@@ -53,9 +49,9 @@ def load_credentials(path):
     return creds
 
 
-# Loaded once per Locust worker process at import time. Each VU that starts
-# up pulls the next pair from this pool (round-robin), so concurrent VUs
-# authenticate as different accounts instead of all sharing one identity.
+# Loaded once when the file is imported. VUs take turns pulling the next
+# pair from this list, so they log in as different accounts instead of all
+# hammering the same one.
 CREDENTIAL_POOL = load_credentials(CREDENTIALS_FILE)
 _credential_cycle = itertools.cycle(CREDENTIAL_POOL)
 _credential_lock = Lock()
@@ -81,27 +77,25 @@ STATUS_ACTIVE = "Active"
 class SubscriptionUser(HttpUser):
     wait_time = constant(11)  # fixed think-time between tasks, per VU
 
-    # Shared across every VU in this worker process. Topics are static
-    # reference data -- fetched once by whichever VU gets there first,
-    # then reused by every other VU instead of re-hitting the API.
-    # (In distributed mode each worker process still fetches its own copy
-    # once, since Python memory isn't shared across processes -- that's
-    # still one call per worker instead of one call per VU.)
+    # Shared by all VUs in this process. The first VU to need topics fetches
+    # them; everyone else reuses that result instead of asking the API again.
+    # (Running distributed? Each worker process fetches its own copy once --
+    # still one call per worker, not one per VU.)
     _topics_cache = None
     _topics_lock = Lock()
 
     def on_start(self):
         self.headers = {}
-        self.subscriptions = {}     # {subscription_id: expected_status}, owned by THIS VU only
+        self.subscriptions = {}     # this VU's own subs: {subscription_id: status we expect}
         self.client_id, self.client_secret = get_next_credentials()
         self.authenticate()
         self.topics = self._get_shared_topics()
 
     def authenticate(self):
-        """Get a bearer token via the client-credentials grant, once per VU
-        at startup, using this VU's own client_id/client_secret pulled from
-        the credentials pool. Sent as form-data, and the token is read from
-        the JSON response's access_token field."""
+        """Log in once at startup and save the bearer token for later calls.
+
+        Uses this VU's own client_id/client_secret (sent as form data, not
+        JSON). The token comes back in the response's access_token field."""
         payload = {
             "grant_type": AUTH_GRANT_TYPE,
             "client_id": self.client_id,
@@ -134,23 +128,21 @@ class SubscriptionUser(HttpUser):
         return [sid for sid, st in self.subscriptions.items() if st == status]
 
     def _get_shared_topics(self):
-        """Return the cached topic list, fetching it over HTTP only if no
-        VU in this worker process has fetched it yet. Not a repeated
-        @task -- topics are static reference data and re-fetching them
-        during the steady-state load adds no useful signal, just noise."""
+        """Return the topic list, fetching it from the API only the first
+        time. It's not a @task on purpose -- topics don't change, so asking
+        for them over and over during the test would just add noise."""
         cls = type(self)
         if cls._topics_cache:
             return cls._topics_cache
 
         with cls._topics_lock:
-            # Re-check after acquiring the lock -- another VU may have
-            # finished the fetch while we were waiting on it.
+            # Someone else may have finished the fetch while we waited for
+            # the lock -- check again before doing it ourselves.
             if cls._topics_cache:
                 return cls._topics_cache
-            # Only a non-empty result gets cached. A failed/empty fetch
-            # returns [] so this VU sits out this round, and the next VU
-            # retries instead of the whole worker being poisoned by one
-            # bad first fetch.
+            # Only cache a real, non-empty result. If the fetch fails we
+            # return [] without caching, so the next VU tries again instead
+            # of everyone being stuck with one bad first result.
             fetched = self._fetch_topics_from_api()
             if fetched:
                 cls._topics_cache = fetched
@@ -170,8 +162,8 @@ class SubscriptionUser(HttpUser):
                 resp.failure("Invalid JSON response")
                 return []
             topics = data.get("topics", []) if isinstance(data, dict) else data
-            # topics come back as {"name": ..., "description": ...} -- no id field,
-            # "name" is the identifier used to create a subscription
+            # Each topic looks like {"name": ..., "description": ...}. There's
+            # no id -- "name" is what we use to create a subscription.
             fetched = [t["name"] for t in topics if "name" in t]
             resp.success()
             return fetched
@@ -179,7 +171,7 @@ class SubscriptionUser(HttpUser):
     @task(4)
     def create_subscription(self):
         if not self.topics:
-            return  # need topics first
+            return  # can't subscribe to anything without topics
 
         sample_size = random.randint(1, min(3, len(self.topics)))
         chosen = random.sample(self.topics, sample_size)
@@ -201,7 +193,7 @@ class SubscriptionUser(HttpUser):
                     resp.failure("Response body had no subscriptionId")
                     return
 
-                # newly created subscriptions start out "paused"
+                # new subscriptions always start out Paused
                 self.subscriptions[sub_id] = STATUS_PAUSED
                 resp.success()
             else:
@@ -209,23 +201,20 @@ class SubscriptionUser(HttpUser):
 
     @staticmethod
     def _extract_subscription_id(data):
-        """Extract the id from a POST /subscriptions/subscribe response.
+        """Pull the subscription id out of a subscribe response.
 
-        Confirmed real shape (flat body):
-            {"subscriptionId": "...", "queue": "..."}
-
-        "subscriptionId" is the only source of truth here -- "queue" is a
-        separate, distinct value on the real API (not a reliable stand-in
-        for the id) and is intentionally not used as a fallback.
+        The body looks like {"subscriptionId": "...", "queue": "..."}.
+        We only trust "subscriptionId". "queue" is a different value, not
+        another name for the id, so we never fall back to it.
         """
         if not isinstance(data, dict):
             return None
         return data.get("subscriptionId")
 
     def _change_state(self, sub_id, path, new_status, name):
-        """PUT to `path` for one subscription; on success record `new_status`
-        as this VU's new local expectation for it. Shared by the resume and
-        pause tasks, which differ only in path/status/report name."""
+        """Resume or pause one subscription. On success, remember the new
+        status locally. The resume and pause tasks both use this -- they only
+        differ in which path, status, and report name they pass in."""
         with self.client.put(
             path.format(id=sub_id), headers=self.headers,
             name=name, catch_response=True
@@ -240,7 +229,7 @@ class SubscriptionUser(HttpUser):
     def activate_subscription(self):
         candidates = self._ids_with_status(STATUS_PAUSED)
         if not candidates:
-            return  # nothing eligible to activate right now
+            return  # nothing paused to resume right now
         self._change_state(
             random.choice(candidates), ACTIVATE_PATH,
             STATUS_ACTIVE, "/subscriptions/:id/resume [PUT]")
@@ -249,7 +238,7 @@ class SubscriptionUser(HttpUser):
     def pause_subscription(self):
         candidates = self._ids_with_status(STATUS_ACTIVE)
         if not candidates:
-            return  # nothing eligible to pause right now
+            return  # nothing active to pause right now
         self._change_state(
             random.choice(candidates), PAUSE_PATH,
             STATUS_PAUSED, "/subscriptions/:id/pause [PUT]")
@@ -270,9 +259,8 @@ class SubscriptionUser(HttpUser):
                 resp.failure("Invalid JSON response")
                 return
 
-            # Cross-check API-reported state against what this VU expects
-            # Real shape: {"id": ..., "queue": ..., "state": "Active"/"Paused",
-            #              "topics": [...], "updatedAtUtc": ...}
+            # Compare what the API reports against what this VU expects.
+            # Each item looks like {"id": ..., "state": "Active"/"Paused", ...}.
             mismatches = []
             for item in items:
                 sid = item.get("id")
