@@ -23,10 +23,12 @@ state each one should be in. Two things fall out of that:
 
 import csv
 import itertools
+import os
 import random
 from threading import Lock
 
 from locust import HttpUser, task, constant
+from requests_pkcs12 import Pkcs12Adapter
 
 # ---- CONFIG: fill these in to match your real API ----
 AUTH_URL = "REPLACE_WITH_AUTH_URI"  # the login / token endpoint
@@ -34,6 +36,14 @@ AUTH_URL = "REPLACE_WITH_AUTH_URI"  # the login / token endpoint
 CREDENTIALS_FILE = "credentials.csv"  # CSV with a header row: client_id,client_secret
 AUTH_SCOPE = "123"                    # same scope for every account
 AUTH_GRANT_TYPE = "client_credentials"  # login type, sent as form data (not JSON)
+
+# Client certificate (mutual TLS). The API now wants a .p12 client cert on
+# top of the client_id/secret login. requests can't read .p12 files itself,
+# so we hand this to a small adapter (see _mount_client_cert below).
+CLIENT_CERT_FILE = "cert.p12"  # path to your .p12 bundle
+# The .p12 passphrase. Defaults to the dev value below, but an env var wins
+# if set -- PowerShell:  $env:CLIENT_CERT_PASSWORD = "your-pass"
+CLIENT_CERT_PASSWORD = os.environ.get("CLIENT_CERT_PASSWORD", "1234")
 
 
 def load_credentials(path):
@@ -88,8 +98,28 @@ class SubscriptionUser(HttpUser):
         self.headers = {}
         self.subscriptions = {}     # this VU's own subs: {subscription_id: status we expect}
         self.client_id, self.client_secret = get_next_credentials()
+        self._mount_client_cert()
         self.authenticate()
         self.topics = self._get_shared_topics()
+
+    def _mount_client_cert(self):
+        """Make every HTTPS call from this VU present our .p12 client cert.
+
+        The API now requires a client certificate, and plain `requests` can't
+        load a .p12 file. This adapter opens the .p12 with its passphrase and
+        takes over the TLS handshake, so the rest of the code stays the same."""
+        if not CLIENT_CERT_PASSWORD:
+            raise ValueError(
+                "CLIENT_CERT_PASSWORD is not set -- export the .p12 passphrase "
+                "before running (see CONFIG at the top of this file)."
+            )
+        self.client.mount(
+            "https://",
+            Pkcs12Adapter(
+                pkcs12_filename=CLIENT_CERT_FILE,
+                pkcs12_password=CLIENT_CERT_PASSWORD,
+            ),
+        )
 
     def authenticate(self):
         """Log in once at startup and save the bearer token for later calls.
